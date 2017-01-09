@@ -774,7 +774,7 @@ usage(void)
     fprintf(stderr, "    -r receive compensation in nanoseconds\n");
     fprintf(stderr, "    -t receive compensation in nanoseconds\n");
     fprintf(stderr, "    -s switch compensation in nanoseconds\n");
-    fprintf(stderr, "    -c cable length in meters (5 ns/m)\n");
+    fprintf(stderr, "    -c cable length in meters (default 0.0)\n");
     fprintf(stderr, "    -o number of ptp clock samples to request\n");
     fprintf(stderr, "    -p preen ptp clock samples to within pct of smallest window (default 25)\n");
     // packet size?
@@ -865,6 +865,13 @@ main(
     tx_socket = socket_create(tx_name, &tx_index, &tx_ptp_index, &tx_addr, &tx_speed);
     rx_socket = socket_create(rx_name, &rx_index, &rx_ptp_index, &rx_addr, &rx_speed);
 
+    if (tx_index == rx_index)
+    {
+        printf("WARNING: Transmit and receive interfaces are the same. Results are unpredictable\n");
+        fflush(stdout);
+        delay(500);
+    }
+
     if (hwstamps)
     {
         // Open the ptp descriptors
@@ -896,8 +903,22 @@ main(
     pthread_join(thread_id, NULL);
 
     // Process the timestamp control messages
-    cmsg_timestamp(&tx_msg, &tx_timestamp);
-    cmsg_timestamp(&rx_msg, &rx_timestamp);
+    if (tx_msg.msg_controllen)
+    {
+        cmsg_timestamp(&tx_msg, &tx_timestamp);
+    }
+    else
+    {
+        fatal("no tx control message (timestamp) received\n");
+    }
+    if (rx_msg.msg_controllen)
+    {
+        cmsg_timestamp(&rx_msg, &rx_timestamp);
+    }
+    else
+    {
+        fatal("no rx control message (timestamp) received\n");
+    }
 
     if (hwstamps)
     {
