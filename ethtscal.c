@@ -113,8 +113,8 @@ static int                      tx_index;
 static int                      rx_index;
 static struct ether_addr        tx_addr;
 static struct ether_addr        rx_addr;
-static long                     tx_speed;
-static long                     rx_speed;
+static int                      tx_speed;
+static int                      rx_speed;
 
 // ptp clock info
 static int                      tx_ptpdev;
@@ -201,7 +201,7 @@ socket_create(
     int *                       index,
     int *                       phc_index,
     struct ether_addr *         addr,
-    long *                      speed)
+    int *                       speed)
 {
     struct sockaddr_ll          sockaddr_ll;
     struct ifreq                iface;
@@ -272,7 +272,11 @@ socket_create(
         perror("ioctl");
         fatal("request iterface configuration for %s failed\n", ifname);
     }
-    *speed = ethtool_cmd_speed(&ether_cmd);
+    *speed = (long) ethtool_cmd_speed(&ether_cmd);
+    if (*speed == 0 || *speed == SPEED_UNKNOWN)
+    {
+        fatal("interface speed for %s is unkown\n", ifname);
+    }
 
     // Check for eee
     memset(&ether_eee, 0, sizeof(ether_eee));
@@ -930,8 +934,8 @@ main(
     tx_rx_raw = timespec_delta(&tx_timestamp, &rx_timestamp);
     cable_comp = (long) (cable_len * NSEC_PER_METER);
 
-    printf("Tx interface %s, speed %ldMb, adddress %s\n", tx_name, tx_speed, ether_ntoa(&tx_addr));
-    printf("Rx interface %s, speed %ldMb, adddress %s\n", rx_name, rx_speed, ether_ntoa(&rx_addr));
+    printf("Tx interface %s, speed %dMb, adddress %s\n", tx_name, tx_speed, ether_ntoa(&tx_addr));
+    printf("Rx interface %s, speed %dMb, adddress %s\n", rx_name, rx_speed, ether_ntoa(&rx_addr));
     printf("\n");
     if (hwstamps)
     {
@@ -957,11 +961,11 @@ main(
     printf("Tx -> Rx timestamp:\n");
     printf("  Uncompensated                    %8ldns\n", tx_rx_raw);
 
-    sfsw_expected = ETHER_SFSW_TX_BITS * BILLION / (tx_speed * MILLION) +
-                    ETHER_SFSW_RX_BITS * BILLION / (rx_speed * MILLION) +
+    sfsw_expected = ETHER_SFSW_TX_BITS * BILLION / ((long) tx_speed * MILLION) +
+                    ETHER_SFSW_RX_BITS * BILLION / ((long) rx_speed * MILLION) +
                     sw_comp + cable_comp;
-    ctsw_expected = ETHER_CTSW_TX_BITS * BILLION / (tx_speed * MILLION) +
-                    ETHER_CTSW_RX_BITS * BILLION / (rx_speed * MILLION) +
+    ctsw_expected = ETHER_CTSW_TX_BITS * BILLION / ((long) tx_speed * MILLION) +
+                    ETHER_CTSW_RX_BITS * BILLION / ((long) rx_speed * MILLION) +
                     sw_comp + cable_comp;
     tx_rx_compensated = tx_rx_raw - tx_comp - rx_comp;
 
