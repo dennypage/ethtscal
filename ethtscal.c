@@ -236,13 +236,13 @@ socket_create(
     // Bind the socket
     memset(&sockaddr_ll, 0, sizeof(sockaddr_ll));
     sockaddr_ll.sll_family = AF_PACKET;
-    sockaddr_ll.sll_ifindex = rx_index;
     sockaddr_ll.sll_protocol = htons(ETH_P_ALL);
+    sockaddr_ll.sll_ifindex = iface.ifr_ifindex;
     r = bind(sock, (struct sockaddr *) &sockaddr_ll, sizeof(sockaddr_ll));
     if (r == -1)
     {
         perror("bind");
-        fatal("request to bind socket to interface %s failed\n", rx_name);
+        fatal("request to bind socket to interface %s failed\n", ifname);
     }
 
     // Get hardware (mac) address of interface
@@ -272,7 +272,7 @@ socket_create(
         perror("ioctl");
         fatal("request iterface configuration for %s failed\n", ifname);
     }
-    *speed = (long) ethtool_cmd_speed(&ether_cmd);
+    *speed = (int) ethtool_cmd_speed(&ether_cmd);
     if (*speed == 0 || *speed == SPEED_UNKNOWN)
     {
         fatal("interface speed for %s is unkown\n", ifname);
