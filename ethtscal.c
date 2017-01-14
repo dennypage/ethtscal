@@ -85,7 +85,7 @@
 #define MILLION                 (1000000L)
 #define BILLION                 (1000000000L)
 
-#define TX_SEND_DELAY           (500)           // Milliseconds to delay before send
+#define TX_SEND_DELAY           (100)           // Milliseconds to delay before send
 #define TX_POLL_LIMIT           (1000L)         // Milliseconds to wait for timestamp
 #define RX_POLL_LIMIT           (2000L)         // Milliseconds to wait for packet
 
@@ -129,10 +129,6 @@ static long                     tx_offset_avg;
 static long                     rx_offset_avg;
 
 // tx/rx message and packet buffers
-static struct msghdr            tx_msg;
-static struct msghdr            rx_msg;
-static char                     tx_cmsg[CMSG_BUF_LEN];
-static char                     rx_cmsg[CMSG_BUF_LEN];
 static char                     tx_packet[ETHER_PACKET_BYTES];
 static char                     tx_packet2[ETHER_PACKET_BYTES];
 static char                     rx_packet[ETH_FRAME_LEN];
@@ -151,8 +147,22 @@ static struct timespec          rx_timestamp;
 
 
 //
-// Fatal error
+// Error
 //
+#if 0
+__attribute__ ((format (printf, 1, 2)))
+static void
+error(
+    const char *                format,
+    ...)
+{
+    va_list                     args;
+
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+}
+#endif
 __attribute__ ((noreturn, format (printf, 1, 2)))
 static void
 fatal(
@@ -238,6 +248,9 @@ socket_create(
     sockaddr_ll.sll_family = AF_PACKET;
     sockaddr_ll.sll_protocol = htons(ETH_P_ALL);
     sockaddr_ll.sll_ifindex = iface.ifr_ifindex;
+    sockaddr_ll.sll_halen = 1;
+    // Valgrind reports that bind reads beyond the end of the sockaddr_ll. There doesn't seem
+    // to be a reasonable way to prevent this.
     r = bind(sock, (struct sockaddr *) &sockaddr_ll, sizeof(sockaddr_ll));
     if (r == -1)
     {
@@ -381,7 +394,7 @@ drain(
     struct msghdr               msg;
     struct iovec                iovec;
     char                        packet[ETH_FRAME_LEN];
-    char                        cmsg[CMSG_BUF_LEN];
+    char                        cmsg_buf[CMSG_BUF_LEN];
     long                        len;
 
     do
@@ -392,8 +405,8 @@ drain(
         msg.msg_name = NULL;
         msg.msg_iov = &iovec;
         msg.msg_iovlen = 1;
-        msg.msg_control = &cmsg;
-        msg.msg_controllen = sizeof(cmsg);
+        msg.msg_control = &cmsg_buf;
+        msg.msg_controllen = sizeof(cmsg_buf);
 
         len = recvmsg(sock, &msg, MSG_DONTWAIT | errorqueue);
     }
@@ -622,6 +635,8 @@ rx_thread(
 {
     struct iovec                iovec;
     struct pollfd               pfd;
+    struct msghdr               msg_hdr;
+    char                        cmsg_buf[CMSG_BUF_LEN];
     long                        len;
     int                         r;
 
@@ -634,11 +649,12 @@ rx_thread(
         // Set up for rx recvmsg
         iovec.iov_base = &rx_packet;
         iovec.iov_len = sizeof(rx_packet);
-        rx_msg.msg_name = NULL;
-        rx_msg.msg_iov = &iovec;
-        rx_msg.msg_iovlen = 1;
-        rx_msg.msg_control = &rx_cmsg;
-        rx_msg.msg_controllen = sizeof(rx_cmsg);
+        msg_hdr.msg_name = NULL;
+        msg_hdr.msg_namelen = 0;
+        msg_hdr.msg_iov = &iovec;
+        msg_hdr.msg_iovlen = 1;
+        msg_hdr.msg_control = &cmsg_buf;
+        msg_hdr.msg_controllen = sizeof(cmsg_buf);
 
         // Wait for the packet to arrive
         r = poll(&pfd, 1, RX_POLL_LIMIT);
@@ -655,7 +671,7 @@ rx_thread(
             ptp_offset_capture(rx_ptpdev, &rx_ptp_offset);
         }
 
-        len = recvmsg(rx_socket, &rx_msg, 0);
+        len = recvmsg(rx_socket, &msg_hdr, 0);
         if (len == -1)
         {
             perror("recvmsg");
@@ -665,6 +681,21 @@ rx_thread(
         // Is this is our packet?
         if (memcmp(tx_packet, rx_packet, sizeof(tx_packet)) == 0)
         {
+            // Process the timestamp control message
+            if (msg_hdr.msg_controllen)
+            {
+                cmsg_timestamp(&msg_hdr, &rx_timestamp);
+            }
+            else
+            {
+                fatal("no rx control message (timestamp) received\n");
+            }
+
+            if (hwstamps)
+            {
+                ptp_offset_average(&rx_ptp_offset, &rx_offset_avg, &rx_ptp_samples_used);
+                timespec_addns(&rx_timestamp, rx_offset_avg);
+            }
             return(0);
         }
     }
@@ -682,6 +713,8 @@ do_send(void)
     struct sockaddr_ll          sockaddr_ll;
     struct ethhdr *             hdr;
     struct pollfd               pfd;
+    struct msghdr               msg_hdr;
+    char                        cmsg_buf[CMSG_BUF_LEN];
     long                        len;
     int                         r;
 
@@ -711,14 +744,18 @@ do_send(void)
     // Set up for recvmsg
     iovec.iov_base = &tx_packet2;
     iovec.iov_len = sizeof(tx_packet2);
-    tx_msg.msg_name = NULL;
-    tx_msg.msg_iov = &iovec;
-    tx_msg.msg_iovlen = 1;
-    tx_msg.msg_control = &tx_cmsg;
-    tx_msg.msg_controllen = sizeof (tx_cmsg);
+    msg_hdr.msg_name = NULL;
+    msg_hdr.msg_namelen = 0;
+    msg_hdr.msg_name = NULL;
+    msg_hdr.msg_iov = &iovec;
+    msg_hdr.msg_iovlen = 1;
+    msg_hdr.msg_control = &cmsg_buf;
+    msg_hdr.msg_controllen = sizeof (cmsg_buf);
 
     delay(TX_SEND_DELAY);
     clock_gettime(CLOCK_REALTIME, &tx_before_send);
+    // Valgrind reports that sendto reads beyond the end of the sockaddr_ll. There doesn't seem
+    // to be a reasonable way to prevent this.
     len = sendto(tx_socket, tx_packet, sizeof(tx_packet), 0, (struct sockaddr *) &sockaddr_ll, sizeof(sockaddr_ll));
     if (len == -1 || len != sizeof(tx_packet))
     {
@@ -743,7 +780,7 @@ do_send(void)
     }
     clock_gettime(CLOCK_REALTIME, &tx_after_poll);
 
-    len = recvmsg(tx_socket, &tx_msg, MSG_ERRQUEUE);
+    len = recvmsg(tx_socket, &msg_hdr, MSG_ERRQUEUE);
     if (len == -1)
     {
         perror("recvmsg");
@@ -754,6 +791,21 @@ do_send(void)
     if (memcmp(tx_packet, tx_packet2, sizeof(tx_packet)) != 0)
     {
         fatal("send and timestamp packet do not match\n");
+    }
+
+    // Process the timestamp control message
+    if (msg_hdr.msg_controllen)
+    {
+        cmsg_timestamp(&msg_hdr, &tx_timestamp);
+    }
+    else
+    {
+        fatal("no tx control message (timestamp) received\n");
+    }
+    if (hwstamps)
+    {
+        ptp_offset_average(&tx_ptp_offset, &tx_offset_avg, &tx_ptp_samples_used);
+        timespec_addns(&tx_timestamp, tx_offset_avg);
     }
 }
 
@@ -876,6 +928,10 @@ main(
         tx_ptpdev = ptpdev_open(tx_ptp_index);
         rx_ptpdev = ptpdev_open(rx_ptp_index);
     }
+    else
+    {
+        printf("WARNING: Using softare timestamps instead of hardware. Results will be inaccurate.\n\n");
+    }
 
     // Drain any pending messages and clear any error state.
     //
@@ -899,37 +955,6 @@ main(
 
     // Wait for receive thread to return
     pthread_join(thread_id, NULL);
-
-    // Process the timestamp control messages
-    if (tx_msg.msg_controllen)
-    {
-        cmsg_timestamp(&tx_msg, &tx_timestamp);
-    }
-    else
-    {
-        fatal("no tx control message (timestamp) received\n");
-    }
-    if (rx_msg.msg_controllen)
-    {
-        cmsg_timestamp(&rx_msg, &rx_timestamp);
-    }
-    else
-    {
-        fatal("no rx control message (timestamp) received\n");
-    }
-
-    if (hwstamps)
-    {
-        ptp_offset_average(&tx_ptp_offset, &tx_offset_avg, &tx_ptp_samples_used);
-        ptp_offset_average(&rx_ptp_offset, &rx_offset_avg, &rx_ptp_samples_used);
-
-        timespec_addns(&rx_timestamp, rx_offset_avg);
-        timespec_addns(&tx_timestamp, tx_offset_avg);
-    }
-    else
-    {
-        printf("WARNING: Using softare timestamps instead of hardware. Results will be inaccurate.\n\n");
-    }
 
     tx_rx_raw = timespec_delta(&tx_timestamp, &rx_timestamp);
     cable_comp = (long) (cable_len * NSEC_PER_METER);
