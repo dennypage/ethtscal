@@ -121,8 +121,7 @@ static int                      tx_ptpdev;
 static int                      rx_ptpdev;
 static int                      tx_ptp_index;
 static int                      rx_ptp_index;
-static struct ptp_sys_offset    tx_ptp_offset;
-static struct ptp_sys_offset    rx_ptp_offset;
+
 static long                     tx_ptp_samples_used = 0;
 static long                     rx_ptp_samples_used = 0;
 static long                     tx_offset_avg;
@@ -130,8 +129,6 @@ static long                     rx_offset_avg;
 
 // tx/rx message and packet buffers
 static char                     tx_packet[ETHER_PACKET_BYTES];
-static char                     tx_packet2[ETHER_PACKET_BYTES];
-static char                     rx_packet[ETH_FRAME_LEN];
 
 // tx/rx miscellaneous system timestamps
 static struct timespec          tx_before_send;
@@ -637,8 +634,13 @@ rx_thread(
     struct pollfd               pfd;
     struct msghdr               msg_hdr;
     char                        cmsg_buf[CMSG_BUF_LEN];
+    char                        rx_packet[ETH_FRAME_LEN];
+    struct ptp_sys_offset       ptp_offset;
     long                        len;
     int                         r;
+
+    // Silence valgrind
+    memset(&ptp_offset, 0, sizeof(ptp_offset));
 
     // Set up for poll
     pfd.fd = rx_socket;
@@ -668,7 +670,7 @@ rx_thread(
         if (hwstamps)
         {
             // Record phy vs sys.
-            ptp_offset_capture(rx_ptpdev, &rx_ptp_offset);
+            ptp_offset_capture(rx_ptpdev, &ptp_offset);
         }
 
         len = recvmsg(rx_socket, &msg_hdr, 0);
@@ -693,12 +695,14 @@ rx_thread(
 
             if (hwstamps)
             {
-                ptp_offset_average(&rx_ptp_offset, &rx_offset_avg, &rx_ptp_samples_used);
+                ptp_offset_average(&ptp_offset, &rx_offset_avg, &rx_ptp_samples_used);
                 timespec_addns(&rx_timestamp, rx_offset_avg);
             }
-            return(0);
+
+            break;
         }
     }
+    return(0);
 }
 
 
@@ -715,6 +719,8 @@ do_send(void)
     struct pollfd               pfd;
     struct msghdr               msg_hdr;
     char                        cmsg_buf[CMSG_BUF_LEN];
+    struct ptp_sys_offset       ptp_offset;
+    char                        tx_packet_copy[ETHER_PACKET_BYTES];
     long                        len;
     int                         r;
 
@@ -723,6 +729,9 @@ do_send(void)
     assert(sizeof(rx_addr) <= sizeof(hdr->h_dest));
     assert(sizeof(tx_addr) <= sizeof(hdr->h_source));
     assert(sizeof(rx_addr) <= sizeof(sockaddr_ll.sll_addr));
+
+    // Silence valgrind
+    memset(&ptp_offset, 0, sizeof(ptp_offset));
 
     // Format ethernet header
     hdr = (struct ethhdr *) &tx_packet;
@@ -742,8 +751,8 @@ do_send(void)
     pfd.events = POLLPRI;
 
     // Set up for recvmsg
-    iovec.iov_base = &tx_packet2;
-    iovec.iov_len = sizeof(tx_packet2);
+    iovec.iov_base = &tx_packet_copy;
+    iovec.iov_len = sizeof(tx_packet_copy);
     msg_hdr.msg_name = NULL;
     msg_hdr.msg_namelen = 0;
     msg_hdr.msg_name = NULL;
@@ -767,7 +776,7 @@ do_send(void)
     if (hwstamps)
     {
         // Record phy vs sys
-        ptp_offset_capture(tx_ptpdev, &tx_ptp_offset);
+        ptp_offset_capture(tx_ptpdev, &ptp_offset);
     }
 
     // Wait for the timestamp
@@ -788,7 +797,7 @@ do_send(void)
     }
 
     // Safety check
-    if (memcmp(tx_packet, tx_packet2, sizeof(tx_packet)) != 0)
+    if (memcmp(tx_packet, tx_packet_copy, sizeof(tx_packet)) != 0)
     {
         fatal("send and timestamp packet do not match\n");
     }
@@ -804,7 +813,7 @@ do_send(void)
     }
     if (hwstamps)
     {
-        ptp_offset_average(&tx_ptp_offset, &tx_offset_avg, &tx_ptp_samples_used);
+        ptp_offset_average(&ptp_offset, &tx_offset_avg, &tx_ptp_samples_used);
         timespec_addns(&tx_timestamp, tx_offset_avg);
     }
 }
