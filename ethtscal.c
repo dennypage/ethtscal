@@ -85,7 +85,8 @@
 #define MILLION                 (1000000L)
 #define BILLION                 (1000000000L)
 
-#define TX_SEND_DELAY           (100)           // Milliseconds to delay before send
+#define START_DELAY             (100)           // Milliseconds to delay before starting
+#define TX_SEND_DELAY           (2)             // Milliseconds to delay before each send
 #define TX_POLL_LIMIT           (1000L)         // Milliseconds to wait for timestamp
 #define RX_POLL_LIMIT           (2000L)         // Milliseconds to wait for packet
 
@@ -95,12 +96,14 @@
 // Command line parameters
 static const char *             progname;
 static int                      hwstamps = 1;
+static unsigned long            iterations = 1;
 static long                     rx_comp = 0;
 static long                     tx_comp = 0;
 static long                     sw_comp = 0;
 static double                   cable_len = 0.0;
 static unsigned long            ptp_samples = PTP_MAX_SAMPLES;
-static unsigned long            ptp_preen_pct = 25;
+static unsigned long            ptp_preen_pct = 100;
+static unsigned long            ptp_quality = 0;
 
 // tx/rx sockets
 static int                      tx_socket;
@@ -122,24 +125,36 @@ static int                      rx_ptpdev;
 static int                      tx_ptp_index;
 static int                      rx_ptp_index;
 
-static long                     tx_ptp_samples_used = 0;
-static long                     rx_ptp_samples_used = 0;
-static long                     tx_offset_avg;
-static long                     rx_offset_avg;
-
 // tx/rx message and packet buffers
 static char                     tx_packet[ETHER_PACKET_BYTES];
 
-// tx/rx miscellaneous system timestamps
-static struct timespec          tx_before_send;
-static struct timespec          tx_after_send;
-static struct timespec          tx_before_poll;
-static struct timespec          tx_after_poll;
-static struct timespec          rx_after_poll;
+typedef struct
+{
+    struct timespec             timestamp;
+    long                        before_send_to_after_send;
+    long                        before_send_to_timestamp;
+    long                        after_send_to_before_poll;
+    long                        after_send_to_after_poll;
+    unsigned long               ptp_samples_used;
+    long                        ptp_offset_avg;
+}
+send_times;
 
-// tx/rx hardware or driver timestamps
-static struct timespec          tx_timestamp;
-static struct timespec          rx_timestamp;
+typedef struct
+{
+    struct timespec             timestamp;
+    long                        timestamp_to_poll_return;
+    unsigned long               ptp_samples_used;
+    long                        ptp_offset_avg;
+}
+recv_times;
+
+static send_times *             tx_values;
+static recv_times *             rx_values;
+
+
+
+// tx/rx miscellaneous system timestamps
 
 
 
@@ -549,14 +564,14 @@ static void
 ptp_offset_average(
     struct ptp_sys_offset *     ptp_offset,
     long *                      average,
-    long *                      samples_used)
+    unsigned long *             samples_used)
 {
     long                        window[PTP_MAX_SAMPLES];
     long                        offset[PTP_MAX_SAMPLES];
     long                        smallest_window = LONG_MAX;
-    long                        used = 0;
     long                        total_offset = 0;
     long                        total_window = 0;
+    unsigned long               used = 0;
     struct ptp_clock_time *     pc;
     unsigned int                i;
 
@@ -585,7 +600,7 @@ ptp_offset_average(
     }
     assert(used);
 
-    *average = total_offset / used + total_window / used / 2;
+    *average = total_offset / (long) used + total_window / (long) used / 2;
     *samples_used = used;
 }
 
@@ -635,8 +650,10 @@ rx_thread(
     struct msghdr               msg_hdr;
     char                        cmsg_buf[CMSG_BUF_LEN];
     char                        rx_packet[ETH_FRAME_LEN];
+    struct timespec             after_poll;
     struct ptp_sys_offset       ptp_offset;
     long                        len;
+    unsigned int                i;
     int                         r;
 
     // Silence valgrind
@@ -646,61 +663,66 @@ rx_thread(
     pfd.fd = rx_socket;
     pfd.events = POLLIN;
 
-    while (1)
+    for (i = 0; i < iterations; i++)
     {
-        // Set up for rx recvmsg
-        iovec.iov_base = &rx_packet;
-        iovec.iov_len = sizeof(rx_packet);
-        msg_hdr.msg_name = NULL;
-        msg_hdr.msg_namelen = 0;
-        msg_hdr.msg_iov = &iovec;
-        msg_hdr.msg_iovlen = 1;
-        msg_hdr.msg_control = &cmsg_buf;
-        msg_hdr.msg_controllen = sizeof(cmsg_buf);
-
-        // Wait for the packet to arrive
-        r = poll(&pfd, 1, RX_POLL_LIMIT);
-        if (r == -1)
+        while (1)
         {
-            perror("poll");
-            fatal("poll for receive socket failed\n");
-        }
-        clock_gettime(CLOCK_REALTIME, &rx_after_poll);
+            // Set up for rx recvmsg
+            iovec.iov_base = &rx_packet;
+            iovec.iov_len = sizeof(rx_packet);
+            msg_hdr.msg_name = NULL;
+            msg_hdr.msg_namelen = 0;
+            msg_hdr.msg_iov = &iovec;
+            msg_hdr.msg_iovlen = 1;
+            msg_hdr.msg_control = &cmsg_buf;
+            msg_hdr.msg_controllen = sizeof(cmsg_buf);
 
-        if (hwstamps)
-        {
-            // Record phy vs sys.
-            ptp_offset_capture(rx_ptpdev, &ptp_offset);
-        }
-
-        len = recvmsg(rx_socket, &msg_hdr, 0);
-        if (len == -1)
-        {
-            perror("recvmsg");
-            fatal("receive of packet failed\n");
-        }
-
-        // Is this is our packet?
-        if (memcmp(tx_packet, rx_packet, sizeof(tx_packet)) == 0)
-        {
-            // Process the timestamp control message
-            if (msg_hdr.msg_controllen)
+            // Wait for the packet to arrive
+            r = poll(&pfd, 1, RX_POLL_LIMIT);
+            if (r == -1)
             {
-                cmsg_timestamp(&msg_hdr, &rx_timestamp);
+                perror("poll");
+                fatal("poll for receive socket failed\n");
             }
-            else
-            {
-                fatal("no rx control message (timestamp) received\n");
-            }
+            clock_gettime(CLOCK_REALTIME, &after_poll);
 
             if (hwstamps)
             {
-                ptp_offset_average(&ptp_offset, &rx_offset_avg, &rx_ptp_samples_used);
-                timespec_addns(&rx_timestamp, rx_offset_avg);
+                // Record phy vs sys.
+                ptp_offset_capture(rx_ptpdev, &ptp_offset);
             }
 
-            break;
+            len = recvmsg(rx_socket, &msg_hdr, 0);
+            if (len == -1)
+            {
+                perror("recvmsg");
+                fatal("receive of packet failed\n");
+            }
+
+            // Is this is our packet?
+            if (memcmp(tx_packet, rx_packet, sizeof(tx_packet)) == 0)
+            {
+                // Process the timestamp control message
+                if (msg_hdr.msg_controllen)
+                {
+                    cmsg_timestamp(&msg_hdr, &rx_values[i].timestamp);
+                }
+                else
+                {
+                    fatal("no rx control message (timestamp) received\n");
+                }
+
+                if (hwstamps)
+                {
+                    ptp_offset_average(&ptp_offset, &rx_values[i].ptp_offset_avg, &rx_values[i].ptp_samples_used);
+                    timespec_addns(&rx_values[i].timestamp, rx_values[i].ptp_offset_avg);
+                }
+
+                break;
+            }
         }
+
+        rx_values[i].timestamp_to_poll_return = timespec_delta(&rx_values[i].timestamp, &after_poll);
     }
     return(0);
 }
@@ -719,9 +741,14 @@ do_send(void)
     struct pollfd               pfd;
     struct msghdr               msg_hdr;
     char                        cmsg_buf[CMSG_BUF_LEN];
+    struct timespec             before_send;
+    struct timespec             after_send;
+    struct timespec             before_poll;
+    struct timespec             after_poll;
     struct ptp_sys_offset       ptp_offset;
     char                        tx_packet_copy[ETHER_PACKET_BYTES];
     long                        len;
+    unsigned int                i;
     int                         r;
 
     // Safety checks
@@ -750,71 +777,79 @@ do_send(void)
     pfd.fd = tx_socket;
     pfd.events = POLLPRI;
 
-    // Set up for recvmsg
-    iovec.iov_base = &tx_packet_copy;
-    iovec.iov_len = sizeof(tx_packet_copy);
-    msg_hdr.msg_name = NULL;
-    msg_hdr.msg_namelen = 0;
-    msg_hdr.msg_name = NULL;
-    msg_hdr.msg_iov = &iovec;
-    msg_hdr.msg_iovlen = 1;
-    msg_hdr.msg_control = &cmsg_buf;
-    msg_hdr.msg_controllen = sizeof (cmsg_buf);
+    for (i = 0; i < iterations; i++)
+    {
+        // Set up for recvmsg
+        iovec.iov_base = &tx_packet_copy;
+        iovec.iov_len = sizeof(tx_packet_copy);
+        msg_hdr.msg_name = NULL;
+        msg_hdr.msg_namelen = 0;
+        msg_hdr.msg_name = NULL;
+        msg_hdr.msg_iov = &iovec;
+        msg_hdr.msg_iovlen = 1;
+        msg_hdr.msg_control = &cmsg_buf;
+        msg_hdr.msg_controllen = sizeof (cmsg_buf);
 
-    delay(TX_SEND_DELAY);
-    clock_gettime(CLOCK_REALTIME, &tx_before_send);
-    // Valgrind reports that sendto reads beyond the end of the sockaddr_ll. There doesn't seem
-    // to be a reasonable way to prevent this.
-    len = sendto(tx_socket, tx_packet, sizeof(tx_packet), 0, (struct sockaddr *) &sockaddr_ll, sizeof(sockaddr_ll));
-    if (len == -1 || len != sizeof(tx_packet))
-    {
-        perror("sendto");
-        fatal("send of packet from interface %s failed\n", tx_name);
-    }
-    clock_gettime(CLOCK_REALTIME, &tx_after_send);
+        delay(TX_SEND_DELAY);
+        clock_gettime(CLOCK_REALTIME, &before_send);
+        // Valgrind reports that sendto reads beyond the end of the sockaddr_ll. There doesn't seem
+        // to be a reasonable way to prevent this.
+        len = sendto(tx_socket, tx_packet, sizeof(tx_packet), 0, (struct sockaddr *) &sockaddr_ll, sizeof(sockaddr_ll));
+        if (len == -1 || len != sizeof(tx_packet))
+        {
+            perror("sendto");
+            fatal("send of packet from interface %s failed\n", tx_name);
+        }
+        clock_gettime(CLOCK_REALTIME, &after_send);
 
-    if (hwstamps)
-    {
-        // Record phy vs sys
-        ptp_offset_capture(tx_ptpdev, &ptp_offset);
-    }
+        if (hwstamps)
+        {
+            // Record phy vs sys
+            ptp_offset_capture(tx_ptpdev, &ptp_offset);
+        }
 
-    // Wait for the timestamp
-    clock_gettime(CLOCK_REALTIME, &tx_before_poll);
-    r = poll(&pfd, 1, TX_POLL_LIMIT);
-    if (r == -1)
-    {
-        perror("poll");
-        fatal("poll for tx timestamp failed\n");
-    }
-    clock_gettime(CLOCK_REALTIME, &tx_after_poll);
+        // Wait for the timestamp
+        clock_gettime(CLOCK_REALTIME, &before_poll);
+        r = poll(&pfd, 1, TX_POLL_LIMIT);
+        if (r == -1)
+        {
+            perror("poll");
+            fatal("poll for tx timestamp failed\n");
+        }
+        clock_gettime(CLOCK_REALTIME, &after_poll);
 
-    len = recvmsg(tx_socket, &msg_hdr, MSG_ERRQUEUE);
-    if (len == -1)
-    {
-        perror("recvmsg");
-        fatal("receive of tx timestamp failed\n");
-    }
+        len = recvmsg(tx_socket, &msg_hdr, MSG_ERRQUEUE);
+        if (len == -1)
+        {
+            perror("recvmsg");
+            fatal("receive of tx timestamp failed\n");
+        }
 
-    // Safety check
-    if (memcmp(tx_packet, tx_packet_copy, sizeof(tx_packet)) != 0)
-    {
-        fatal("send and timestamp packet do not match\n");
-    }
+        // Safety check
+        if (memcmp(tx_packet, tx_packet_copy, sizeof(tx_packet)) != 0)
+        {
+            fatal("send and timestamp packet do not match\n");
+        }
 
-    // Process the timestamp control message
-    if (msg_hdr.msg_controllen)
-    {
-        cmsg_timestamp(&msg_hdr, &tx_timestamp);
-    }
-    else
-    {
-        fatal("no tx control message (timestamp) received\n");
-    }
-    if (hwstamps)
-    {
-        ptp_offset_average(&ptp_offset, &tx_offset_avg, &tx_ptp_samples_used);
-        timespec_addns(&tx_timestamp, tx_offset_avg);
+        // Process the timestamp control message
+        if (msg_hdr.msg_controllen)
+        {
+            cmsg_timestamp(&msg_hdr, &tx_values[i].timestamp);
+        }
+        else
+        {
+            fatal("no tx control message (timestamp) received\n");
+        }
+        if (hwstamps)
+        {
+            ptp_offset_average(&ptp_offset, &tx_values[i].ptp_offset_avg, &tx_values[i].ptp_samples_used);
+            timespec_addns(&tx_values[i].timestamp, tx_values[i].ptp_offset_avg);
+        }
+
+         tx_values[i].before_send_to_after_send = timespec_delta(&before_send, &after_send);
+         tx_values[i].after_send_to_before_poll = timespec_delta(&after_send, &before_poll);
+         tx_values[i].after_send_to_after_poll = timespec_delta(&after_send, &after_poll);
+         tx_values[i].before_send_to_timestamp = timespec_delta(&before_send, &tx_values[i].timestamp);
     }
 }
 
@@ -827,15 +862,17 @@ static void
 usage(void)
 {
     fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s [-S] [-r rx_comp] [-t tx_comp] [-s sw_comp] [-c cable_len] [-o ptp_samples] [-p ptp_percentage] src_iface dst_iface\n\n", progname);
+    fprintf(stderr, "  %s [-S] [-i iterations] [-r rx_comp] [-t tx_comp] [-s sw_comp] [-c cable_len] [-o ptp_samples] [-p ptp_percentage] [-q minimum_samples] src_iface dst_iface\n\n", progname);
     fprintf(stderr, "  options:\n");
     fprintf(stderr, "    -S use software timestamps instead of hardware timestamps (low accuracy)\n");
+    fprintf(stderr, "    -i number of iterations (default 1)\n");
     fprintf(stderr, "    -r receive compensation in nanoseconds\n");
     fprintf(stderr, "    -t receive compensation in nanoseconds\n");
     fprintf(stderr, "    -s switch compensation in nanoseconds\n");
     fprintf(stderr, "    -c cable length in meters (default 0.0)\n");
     fprintf(stderr, "    -o number of ptp clock samples to request\n");
-    fprintf(stderr, "    -p preen ptp clock samples to within pct of smallest window (default 25)\n");
+    fprintf(stderr, "    -p preen ptp clock samples to within pct of smallest window\n");
+    fprintf(stderr, "    -q minimum number of samples for a successful test\n");
     // packet size?
 }
 
@@ -853,12 +890,15 @@ parse_args(
 
     progname = argv[0];
 
-    while((opt = getopt(argc, argv, "Sr:t:s:c:o:p:")) != -1)
+    while((opt = getopt(argc, argv, "Si:r:t:s:c:o:p:q:")) != -1)
     {
         switch (opt)
         {
         case 'S':
             hwstamps = 0;
+            break;
+        case 'i':
+            iterations = strtoul(optarg, NULL, 10);
             break;
         case 'r':
             rx_comp = strtol(optarg, NULL, 10);
@@ -882,11 +922,16 @@ parse_args(
         case 'p':
             ptp_preen_pct = strtoul(optarg, NULL, 10);
             break;
+        case 'q':
+            ptp_quality = strtoul(optarg, NULL, 10);
+            break;
         default:
             usage();
             exit(EXIT_FAILURE);
         }
     }
+
+    // FIXME check validity of preen and samples vs quality
 
     // Ensure we have the correct number of parameters
     if (argc != optind + 2)
@@ -910,15 +955,45 @@ main(
     char                        *argv[])
 {
     pthread_t                   thread_id;
-    long                        tx_rx_raw;
-    long                        tx_rx_compensated;
     long                        sfsw_expected;
     long                        ctsw_expected;
     long                        cable_comp;
+
+    long                        tx_before_send_to_after_send_total = 0;
+    long                        tx_before_send_to_timestamp_total = 0;
+    long                        tx_after_send_to_before_poll_total = 0;
+    long                        tx_after_send_to_after_poll_total = 0;
+    long                        rx_timestamp_to_poll_return_total = 0;
+    long                        tx_rx_timestamp_total = 0;
+    long                        tx_ptp_samples_used_total = 0;
+    long                        rx_ptp_samples_used_total = 0;
+    long                        tx_ptp_offset_avg_total = 0;
+    long                        rx_ptp_offset_avg_total = 0;
+    long                        count = 0;
+
+    long                        tx_before_send_to_after_send;
+    long                        tx_before_send_to_timestamp;
+    long                        tx_after_send_to_before_poll;
+    long                        tx_after_send_to_after_poll;
+    long                        rx_timestamp_to_poll_return;
+    long                        tx_ptp_samples_used;
+    long                        rx_ptp_samples_used;
+    long                        tx_ptp_offset_avg;
+    long                        rx_ptp_offset_avg;
+
+    long                        tx_rx_raw;
+    long                        tx_rx_compensated;
+
+    unsigned int                i;
     int                         r;
 
     // Handle command line args
     parse_args(argc, argv);
+
+    tx_values = calloc((size_t) iterations, sizeof(*tx_values));
+    rx_values = calloc((size_t) iterations, sizeof(*rx_values));
+    assert(tx_values);
+    assert(rx_values);
 
     // Create the sockets
     tx_socket = socket_create(tx_name, &tx_index, &tx_ptp_index, &tx_addr, &tx_speed);
@@ -959,31 +1034,89 @@ main(
         fatal("cannot create receive thread\n");
     }
 
+    cable_comp = (long) (cable_len * NSEC_PER_METER);
+    sfsw_expected = ETHER_SFSW_TX_BITS * BILLION / ((long) tx_speed * MILLION) +
+                    ETHER_SFSW_RX_BITS * BILLION / ((long) rx_speed * MILLION) +
+                    sw_comp + cable_comp;
+    ctsw_expected = ETHER_CTSW_TX_BITS * BILLION / ((long) tx_speed * MILLION) +
+                    ETHER_CTSW_RX_BITS * BILLION / ((long) rx_speed * MILLION) +
+                    sw_comp + cable_comp;
+
+    if (iterations > 1)
+    {
+        printf("Iterating over %lu packets (minimum runtime %ld seconds)\n\n", iterations,
+               (TX_SEND_DELAY * MILLION + sfsw_expected) * (long) iterations / BILLION);
+    }
+
+    // Ensure receive thread is ready
+    delay(START_DELAY);
+
     // Do send
     do_send();
 
     // Wait for receive thread to return
     pthread_join(thread_id, NULL);
 
-    tx_rx_raw = timespec_delta(&tx_timestamp, &rx_timestamp);
-    cable_comp = (long) (cable_len * NSEC_PER_METER);
+    for (i = 0; i < iterations; i++)
+    {
+        if (hwstamps && (tx_values[i].ptp_samples_used < ptp_quality || rx_values[i].ptp_samples_used < ptp_quality))
+        {
+            continue;
+        }
+        count++;
+        tx_ptp_samples_used_total += tx_values[i].ptp_samples_used;
+        rx_ptp_samples_used_total += rx_values[i].ptp_samples_used;
+        tx_ptp_offset_avg_total += tx_values[i].ptp_offset_avg;
+        rx_ptp_offset_avg_total += rx_values[i].ptp_offset_avg;
+        tx_before_send_to_after_send_total += tx_values[i].before_send_to_after_send;
+        tx_before_send_to_timestamp_total += tx_values[i].before_send_to_timestamp;
+        tx_after_send_to_before_poll_total += tx_values[i].after_send_to_before_poll;
+        tx_after_send_to_after_poll_total += tx_values[i].after_send_to_after_poll;
+        rx_timestamp_to_poll_return_total += rx_values[i].timestamp_to_poll_return;
+        tx_rx_timestamp_total += timespec_delta(&tx_values[i].timestamp, &rx_values[i].timestamp);
+    }
+
+    if (count < (long) iterations)
+    {
+        if (count == 0)
+        {
+            fatal("No samples left after preen and quality\n");
+        }
+
+        printf("Using %ld of %ld iterations\n\n", count, iterations);
+    }
+
+    tx_ptp_samples_used = tx_ptp_samples_used_total / count;
+    rx_ptp_samples_used = rx_ptp_samples_used_total / count;
+    tx_ptp_offset_avg = tx_ptp_offset_avg_total / count;
+    rx_ptp_offset_avg = rx_ptp_offset_avg_total / count;
+
+    tx_before_send_to_after_send = tx_before_send_to_after_send_total / count;
+    tx_before_send_to_timestamp = tx_before_send_to_timestamp_total / count;
+    tx_after_send_to_before_poll = tx_after_send_to_before_poll_total / count;
+    tx_after_send_to_after_poll = tx_after_send_to_after_poll_total / count;
+    rx_timestamp_to_poll_return = rx_timestamp_to_poll_return_total / count;
+
+    tx_rx_raw =  tx_rx_timestamp_total / count;
+    tx_rx_compensated = tx_rx_raw - tx_comp - rx_comp;
 
     printf("Tx interface %s, speed %dMb, adddress %s\n", tx_name, tx_speed, ether_ntoa(&tx_addr));
     printf("Rx interface %s, speed %dMb, adddress %s\n", rx_name, rx_speed, ether_ntoa(&rx_addr));
     printf("\n");
     if (hwstamps)
     {
-        printf("Ptp samples %lu, preen percentage %lu\n", ptp_samples, ptp_preen_pct);
-        printf("Tx avg ptp offset %ldns, %lu samples used\n", tx_offset_avg, tx_ptp_samples_used);
-        printf("Rx avg ptp offset %ldns, %lu samples used\n", rx_offset_avg, rx_ptp_samples_used);
+        printf("Ptp samples %lu, preen percentage %lu, minimum samples %lu\n", ptp_samples, ptp_preen_pct, ptp_quality);
+        printf("Tx avg ptp offset %ldns, %lu samples used\n", tx_ptp_offset_avg, tx_ptp_samples_used);
+        printf("Rx avg ptp offset %ldns, %lu samples used\n", rx_ptp_offset_avg, rx_ptp_samples_used);
         printf("\n");
     }
+
     printf("Misc times:\n");
-    printf("  Tx before send  ->  after send   %8ldns\n", timespec_delta(&tx_before_send, &tx_after_send));
-    printf("  Tx before send  ->  tx timestamp %8ldns\n", timespec_delta(&tx_before_send, &tx_timestamp));
-    printf("  Tx after send   ->  before poll  %8ldns\n", timespec_delta(&tx_after_send, &tx_before_poll));
-    printf("  Tx after send   ->  after poll   %8ldns\n", timespec_delta(&tx_after_send, &tx_after_poll));
-    printf("  Rx timestamp    ->  poll return  %8ldns\n", timespec_delta(&rx_timestamp, &rx_after_poll));
+    printf("  Tx before send  ->  after send   %8ldns\n", tx_before_send_to_after_send);
+    printf("  Tx before send  ->  tx timestamp %8ldns\n", tx_before_send_to_timestamp);
+    printf("  Tx after send   ->  before poll  %8ldns\n", tx_after_send_to_before_poll);
+    printf("  Tx after send   ->  after poll   %8ldns\n", tx_after_send_to_after_poll);
+    printf("  Rx timestamp    ->  poll return  %8ldns\n", rx_timestamp_to_poll_return);
     printf("\n");
     printf("Compensation values:\n");
     printf("  Tx timestamp                     %8ldns\n", tx_comp);
@@ -994,15 +1127,6 @@ main(
 
     printf("Tx -> Rx timestamp:\n");
     printf("  Uncompensated                    %8ldns\n", tx_rx_raw);
-
-    sfsw_expected = ETHER_SFSW_TX_BITS * BILLION / ((long) tx_speed * MILLION) +
-                    ETHER_SFSW_RX_BITS * BILLION / ((long) rx_speed * MILLION) +
-                    sw_comp + cable_comp;
-    ctsw_expected = ETHER_CTSW_TX_BITS * BILLION / ((long) tx_speed * MILLION) +
-                    ETHER_CTSW_RX_BITS * BILLION / ((long) rx_speed * MILLION) +
-                    sw_comp + cable_comp;
-    tx_rx_compensated = tx_rx_raw - tx_comp - rx_comp;
-
     printf("  Compensated                      %8ldns\n\n", tx_rx_compensated);
 
     printf("Connection types:       Expected        Error\n");
