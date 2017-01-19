@@ -95,15 +95,13 @@
 
 // Command line parameters
 static const char *             progname;
-static int                      hwstamps = 1;
-static unsigned long            iterations = 1;
+static unsigned int             hwstamps = 1;
+static unsigned int             iterations = 1;
+static unsigned int             ptp_samples = PTP_MAX_SAMPLES;
 static long                     rx_comp = 0;
 static long                     tx_comp = 0;
 static long                     sw_comp = 0;
 static double                   cable_len = 0.0;
-static unsigned long            ptp_samples = PTP_MAX_SAMPLES;
-static unsigned long            ptp_preen_pct = 100;
-static unsigned long            ptp_quality = 0;
 
 // tx/rx sockets
 static int                      tx_socket;
@@ -125,9 +123,10 @@ static int                      rx_ptpdev;
 static int                      tx_ptp_index;
 static int                      rx_ptp_index;
 
-// tx/rx message and packet buffers
+// tx packet buffer
 static char                     tx_packet[ETHER_PACKET_BYTES];
 
+// tx and rx info structures
 typedef struct
 {
     struct timespec             timestamp;
@@ -135,46 +134,28 @@ typedef struct
     long                        before_send_to_timestamp;
     long                        after_send_to_before_poll;
     long                        after_send_to_after_poll;
-    unsigned long               ptp_samples_used;
     long                        ptp_offset_avg;
+    unsigned int                ptp_samples_used;
 }
-send_times;
+tx_info;
 
 typedef struct
 {
     struct timespec             timestamp;
     long                        timestamp_to_poll_return;
-    unsigned long               ptp_samples_used;
     long                        ptp_offset_avg;
+    unsigned int                ptp_samples_used;
 }
-recv_times;
+rx_info;
 
-static send_times *             tx_values;
-static recv_times *             rx_values;
-
-
-
-// tx/rx miscellaneous system timestamps
+static tx_info *                tx_values;
+static rx_info *                rx_values;
 
 
 
 //
 // Error
 //
-#if 0
-__attribute__ ((format (printf, 1, 2)))
-static void
-error(
-    const char *                format,
-    ...)
-{
-    va_list                     args;
-
-    va_start(args, format);
-    vfprintf(stderr, format, args);
-    va_end(args);
-}
-#endif
 __attribute__ ((noreturn, format (printf, 1, 2)))
 static void
 fatal(
@@ -536,6 +517,127 @@ ptpclock_delta(
 
 
 //
+// sqrt function for standard deviation
+//
+static unsigned long
+llsqrt(
+    unsigned long long          x)
+{
+    unsigned long long          prev;
+    unsigned long long          s;
+
+    s = x;
+    if (s)
+    {
+        prev = ~((unsigned long long) 1 << 63);
+
+        while (s < prev)
+        {
+            prev = s;
+            s = (s + (x / s)) / 2;
+        }
+    }
+
+    return (unsigned long) s;
+}
+
+
+
+//
+// Determine the median of an array of longs
+// (Thanks to Torben Mogensen)
+//
+static long
+median(
+    long                        array[],
+    unsigned int                count)
+{
+    long                        min;
+    long                        max;
+    long                        guess;
+    long                        maxltguess;
+    long                        mingtguess;
+    unsigned int                less;
+    unsigned int                greater;
+    unsigned int                equal;
+    unsigned int                i;
+
+    min = array[0];
+    max = array[0];
+
+    for (i = 1; i < count; i++)
+    {
+        if (array[i] < min)
+        {
+            min = array[i];
+        }
+        if (array[i] > max)
+        {
+            max = array[i];
+        }
+    }
+
+    while (1) {
+        less = 0;
+        greater = 0;
+        equal = 0;
+        guess = (min + max) / 2;
+        maxltguess = min;
+        mingtguess = max;
+
+        for (i = 0; i < count; i++)
+        {
+            if (array[i] < guess)
+            {
+                less++;
+                if (array[i] > maxltguess)
+                {
+                    maxltguess = array[i];
+                }
+            }
+            else if (array[i] > guess)
+            {
+                greater++;
+                if (array[i] < mingtguess)
+                {
+                    mingtguess = array[i];
+                }
+            }
+            else
+            {
+                equal++;
+            }
+        }
+        if (less <= (count + 1) / 2 && greater <= (count + 1) / 2)
+        {
+            break;
+        }
+        else if (less > greater)
+        {
+            max = maxltguess;
+        }
+        else
+        {
+            min = mingtguess;
+        }
+    }
+
+    if (less >= (count + 1) / 2) {
+        return(maxltguess);
+    }
+    else if (less + equal >= (count + 1) / 2)
+    {
+        return(guess);
+    }
+    else
+    {
+        return(mingtguess);
+    }
+}
+
+
+
+//
 // Capture the current ptp/sys clock offset
 //
 static void
@@ -564,41 +666,38 @@ static void
 ptp_offset_average(
     struct ptp_sys_offset *     ptp_offset,
     long *                      average,
-    unsigned long *             samples_used)
+    unsigned int *              samples_used)
 {
-    long                        window[PTP_MAX_SAMPLES];
-    long                        offset[PTP_MAX_SAMPLES];
-    long                        smallest_window = LONG_MAX;
+    long                        window[PTP_MAX_SAMPLES] = {0};
     long                        total_offset = 0;
     long                        total_window = 0;
-    unsigned long               used = 0;
+    long                        median_window;
+    unsigned int                used = 0;
     struct ptp_clock_time *     pc;
     unsigned int                i;
 
+    // Record the window sizes
     for (i = 0; i < ptp_offset->n_samples; i++)
     {
         pc = ptp_offset->ts + i * 2;
-
         window[i] = ptpclock_delta(&pc[0], &pc[2]);
-        offset[i] = ptpclock_delta(&pc[1], &pc[0]);
-        if (window[i] < smallest_window)
-        {
-            smallest_window = window[i];
-        }
     }
 
+    // Use samples that are at or below the median window size
+    median_window = median(window, ptp_offset->n_samples);
     for (i = 0; i < ptp_offset->n_samples; i++)
     {
-        if (window[i] > smallest_window + smallest_window * (long) ptp_preen_pct / 100L)
+        if (window[i] > median_window)
         {
             continue;
         }
 
-        total_offset += offset[i];
+        pc = ptp_offset->ts + i * 2;
+        total_offset += ptpclock_delta(&pc[1], &pc[0]);
+
         total_window += window[i];
         used++;
     }
-    assert(used);
 
     *average = total_offset / (long) used + total_window / (long) used / 2;
     *samples_used = used;
@@ -862,7 +961,7 @@ static void
 usage(void)
 {
     fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s [-S] [-i iterations] [-r rx_comp] [-t tx_comp] [-s sw_comp] [-c cable_len] [-o ptp_samples] [-p ptp_percentage] [-q minimum_samples] src_iface dst_iface\n\n", progname);
+    fprintf(stderr, "  %s [-S] [-i iterations] [-r rx_comp] [-t tx_comp] [-s sw_comp] [-c cable_len] [-p ptp_samples] src_iface dst_iface\n\n", progname);
     fprintf(stderr, "  options:\n");
     fprintf(stderr, "    -S use software timestamps instead of hardware timestamps (low accuracy)\n");
     fprintf(stderr, "    -i number of iterations (default 1)\n");
@@ -870,10 +969,7 @@ usage(void)
     fprintf(stderr, "    -t receive compensation in nanoseconds\n");
     fprintf(stderr, "    -s switch compensation in nanoseconds\n");
     fprintf(stderr, "    -c cable length in meters (default 0.0)\n");
-    fprintf(stderr, "    -o number of ptp clock samples to request\n");
-    fprintf(stderr, "    -p preen ptp clock samples to within pct of smallest window\n");
-    fprintf(stderr, "    -q minimum number of samples for a successful test\n");
-    // packet size?
+    fprintf(stderr, "    -p number of ptp clock samples to request\n");
 }
 
 
@@ -890,7 +986,7 @@ parse_args(
 
     progname = argv[0];
 
-    while((opt = getopt(argc, argv, "Si:r:t:s:c:o:p:q:")) != -1)
+    while((opt = getopt(argc, argv, "Si:r:t:s:c:p:")) != -1)
     {
         switch (opt)
         {
@@ -898,7 +994,7 @@ parse_args(
             hwstamps = 0;
             break;
         case 'i':
-            iterations = strtoul(optarg, NULL, 10);
+            iterations = (unsigned int) strtoul(optarg, NULL, 10);
             break;
         case 'r':
             rx_comp = strtol(optarg, NULL, 10);
@@ -912,26 +1008,18 @@ parse_args(
         case 'c':
             cable_len = strtod(optarg, NULL);
             break;
-        case 'o':
-            ptp_samples = strtoul(optarg, NULL, 10);
+        case 'p':
+            ptp_samples = (unsigned int) strtoul(optarg, NULL, 10);
             if (ptp_samples > PTP_MAX_SAMPLES)
             {
                 fatal("ptp_samples must be less than or equal to %d\n", PTP_MAX_SAMPLES);
             }
-            break;
-        case 'p':
-            ptp_preen_pct = strtoul(optarg, NULL, 10);
-            break;
-        case 'q':
-            ptp_quality = strtoul(optarg, NULL, 10);
             break;
         default:
             usage();
             exit(EXIT_FAILURE);
         }
     }
-
-    // FIXME check validity of preen and samples vs quality
 
     // Ensure we have the correct number of parameters
     if (argc != optind + 2)
@@ -965,23 +1053,25 @@ main(
     long                        tx_after_send_to_after_poll_total = 0;
     long                        rx_timestamp_to_poll_return_total = 0;
     long                        tx_rx_timestamp_total = 0;
-    long                        tx_ptp_samples_used_total = 0;
-    long                        rx_ptp_samples_used_total = 0;
+    unsigned long long          tx_rx_timestamp_total2 = 0;
     long                        tx_ptp_offset_avg_total = 0;
     long                        rx_ptp_offset_avg_total = 0;
-    long                        count = 0;
+    unsigned long               tx_ptp_samples_used_total = 0;
+    unsigned long               rx_ptp_samples_used_total = 0;
 
     long                        tx_before_send_to_after_send;
     long                        tx_before_send_to_timestamp;
     long                        tx_after_send_to_before_poll;
     long                        tx_after_send_to_after_poll;
     long                        rx_timestamp_to_poll_return;
-    long                        tx_ptp_samples_used;
-    long                        rx_ptp_samples_used;
     long                        tx_ptp_offset_avg;
     long                        rx_ptp_offset_avg;
+    unsigned long               tx_ptp_samples_used;
+    unsigned long               rx_ptp_samples_used;
 
+    long                        delta;
     long                        tx_rx_raw;
+    unsigned long               tx_rx_raw_stddev;
     long                        tx_rx_compensated;
 
     unsigned int                i;
@@ -1014,7 +1104,7 @@ main(
     }
     else
     {
-        printf("WARNING: Using softare timestamps instead of hardware. Results will be inaccurate.\n\n");
+        printf("WARNING: Using software timestamps instead of hardware. Results will be inaccurate.\n\n");
     }
 
     // Drain any pending messages and clear any error state.
@@ -1044,7 +1134,7 @@ main(
 
     if (iterations > 1)
     {
-        printf("Iterating over %lu packets (minimum runtime %ld seconds)\n\n", iterations,
+        printf("Iterating over %u packets (minimum runtime %ld seconds)\n\n", iterations,
                (TX_SEND_DELAY * MILLION + sfsw_expected) * (long) iterations / BILLION);
     }
 
@@ -1059,11 +1149,6 @@ main(
 
     for (i = 0; i < iterations; i++)
     {
-        if (hwstamps && (tx_values[i].ptp_samples_used < ptp_quality || rx_values[i].ptp_samples_used < ptp_quality))
-        {
-            continue;
-        }
-        count++;
         tx_ptp_samples_used_total += tx_values[i].ptp_samples_used;
         rx_ptp_samples_used_total += rx_values[i].ptp_samples_used;
         tx_ptp_offset_avg_total += tx_values[i].ptp_offset_avg;
@@ -1073,31 +1158,25 @@ main(
         tx_after_send_to_before_poll_total += tx_values[i].after_send_to_before_poll;
         tx_after_send_to_after_poll_total += tx_values[i].after_send_to_after_poll;
         rx_timestamp_to_poll_return_total += rx_values[i].timestamp_to_poll_return;
-        tx_rx_timestamp_total += timespec_delta(&tx_values[i].timestamp, &rx_values[i].timestamp);
+
+        delta = timespec_delta(&tx_values[i].timestamp, &rx_values[i].timestamp);
+        tx_rx_timestamp_total += delta;
+        tx_rx_timestamp_total2 += (unsigned long long) (delta * delta);
     }
 
-    if (count < (long) iterations)
-    {
-        if (count == 0)
-        {
-            fatal("No samples left after preen and quality\n");
-        }
+    tx_ptp_samples_used = tx_ptp_samples_used_total / iterations;
+    rx_ptp_samples_used = rx_ptp_samples_used_total / iterations;
+    tx_ptp_offset_avg = tx_ptp_offset_avg_total / (long) iterations;
+    rx_ptp_offset_avg = rx_ptp_offset_avg_total / (long) iterations;
 
-        printf("Using %ld of %ld iterations\n\n", count, iterations);
-    }
+    tx_before_send_to_after_send = tx_before_send_to_after_send_total / (long) iterations;
+    tx_before_send_to_timestamp = tx_before_send_to_timestamp_total / (long) iterations;
+    tx_after_send_to_before_poll = tx_after_send_to_before_poll_total / (long) iterations;
+    tx_after_send_to_after_poll = tx_after_send_to_after_poll_total / (long) iterations;
+    rx_timestamp_to_poll_return = rx_timestamp_to_poll_return_total / (long) iterations;
 
-    tx_ptp_samples_used = tx_ptp_samples_used_total / count;
-    rx_ptp_samples_used = rx_ptp_samples_used_total / count;
-    tx_ptp_offset_avg = tx_ptp_offset_avg_total / count;
-    rx_ptp_offset_avg = rx_ptp_offset_avg_total / count;
-
-    tx_before_send_to_after_send = tx_before_send_to_after_send_total / count;
-    tx_before_send_to_timestamp = tx_before_send_to_timestamp_total / count;
-    tx_after_send_to_before_poll = tx_after_send_to_before_poll_total / count;
-    tx_after_send_to_after_poll = tx_after_send_to_after_poll_total / count;
-    rx_timestamp_to_poll_return = rx_timestamp_to_poll_return_total / count;
-
-    tx_rx_raw =  tx_rx_timestamp_total / count;
+    tx_rx_raw =  tx_rx_timestamp_total / (long) iterations;
+    tx_rx_raw_stddev = llsqrt((tx_rx_timestamp_total2 / iterations) - ((unsigned long long) (tx_rx_raw * tx_rx_raw)));
     tx_rx_compensated = tx_rx_raw - tx_comp - rx_comp;
 
     printf("Tx interface %s, speed %dMb, adddress %s\n", tx_name, tx_speed, ether_ntoa(&tx_addr));
@@ -1105,9 +1184,8 @@ main(
     printf("\n");
     if (hwstamps)
     {
-        printf("Ptp samples %lu, preen percentage %lu, minimum samples %lu\n", ptp_samples, ptp_preen_pct, ptp_quality);
-        printf("Tx avg ptp offset %ldns, %lu samples used\n", tx_ptp_offset_avg, tx_ptp_samples_used);
-        printf("Rx avg ptp offset %ldns, %lu samples used\n", rx_ptp_offset_avg, rx_ptp_samples_used);
+        printf("Tx avg ptp offset %ldns, %lu of %u samples used\n", tx_ptp_offset_avg, tx_ptp_samples_used, ptp_samples);
+        printf("Rx avg ptp offset %ldns, %lu of %u samples used\n", rx_ptp_offset_avg, rx_ptp_samples_used, ptp_samples);
         printf("\n");
     }
 
@@ -1126,7 +1204,7 @@ main(
     printf("  Total                            %8ldns\n\n", tx_comp + rx_comp + sw_comp + cable_comp);
 
     printf("Tx -> Rx timestamp:\n");
-    printf("  Uncompensated                    %8ldns\n", tx_rx_raw);
+    printf("  Uncompensated                    %8ldns  (stddev %ldns)\n", tx_rx_raw, tx_rx_raw_stddev);
     printf("  Compensated                      %8ldns\n\n", tx_rx_compensated);
 
     printf("Connection types:       Expected        Error\n");
