@@ -1058,6 +1058,7 @@ main(
     long                        rx_ptp_offset_avg_total = 0;
     unsigned long               tx_ptp_samples_used_total = 0;
     unsigned long               rx_ptp_samples_used_total = 0;
+    long *                      tx_rx_deltas;
 
     long                        tx_before_send_to_after_send;
     long                        tx_before_send_to_timestamp;
@@ -1072,6 +1073,7 @@ main(
     long                        delta;
     long                        tx_rx_raw;
     unsigned long               tx_rx_raw_stddev;
+    long                        tx_rx_raw_median;
     long                        tx_rx_compensated;
 
     unsigned int                i;
@@ -1082,6 +1084,7 @@ main(
 
     tx_values = calloc((size_t) iterations, sizeof(*tx_values));
     rx_values = calloc((size_t) iterations, sizeof(*rx_values));
+    tx_rx_deltas = calloc((size_t) iterations, sizeof(long));
     assert(tx_values);
     assert(rx_values);
 
@@ -1160,6 +1163,7 @@ main(
         rx_timestamp_to_poll_return_total += rx_values[i].timestamp_to_poll_return;
 
         delta = timespec_delta(&tx_values[i].timestamp, &rx_values[i].timestamp);
+        tx_rx_deltas[i] = delta;
         tx_rx_timestamp_total += delta;
         tx_rx_timestamp_total2 += (unsigned long long) (delta * delta);
     }
@@ -1177,6 +1181,7 @@ main(
 
     tx_rx_raw =  tx_rx_timestamp_total / (long) iterations;
     tx_rx_raw_stddev = llsqrt((tx_rx_timestamp_total2 / iterations) - ((unsigned long long) (tx_rx_raw * tx_rx_raw)));
+    tx_rx_raw_median = median(tx_rx_deltas, iterations);
     tx_rx_compensated = tx_rx_raw - tx_comp - rx_comp;
 
     printf("Tx interface %s, speed %dMb, adddress %s\n", tx_name, tx_speed, ether_ntoa(&tx_addr));
@@ -1204,7 +1209,8 @@ main(
     printf("  Total                            %8ldns\n\n", tx_comp + rx_comp + sw_comp + cable_comp);
 
     printf("Tx -> Rx timestamp:\n");
-    printf("  Uncompensated                    %8ldns  (stddev %ldns)\n", tx_rx_raw, tx_rx_raw_stddev);
+    printf("  Median                           %8ldns\n", tx_rx_raw_median);
+    printf("  Average                          %8ldns  (stddev %ldns)\n", tx_rx_raw, tx_rx_raw_stddev);
     printf("  Compensated                      %8ldns\n\n", tx_rx_compensated);
 
     printf("Connection types:       Expected        Error\n");
