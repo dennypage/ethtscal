@@ -67,7 +67,7 @@
 
 
 // Ethernet info
-#define ETHER_PROTO             (46) // (ETH_P_802_3)
+#define ETHER_PROTO             (46)
 #define ETHER_PACKET_BYTES      (60L)           // Includes header, but not preabmle/sfd/fcs
 #define ETHER_CS_BITS           (96)            // Carrier sense bits (AKA Inter Packet Gap)
 #define ETHER_PREAMBLE_BITS     (64L)           // Includes SFD
@@ -783,6 +783,10 @@ rx_thread(
                 perror("poll");
                 fatal("poll for receive socket failed\n");
             }
+            else if (r == 0)
+            {
+                fatal("timed out waiting for rx packet\n");
+            }
             clock_gettime(CLOCK_REALTIME, &after_poll);
 
             if (hwstamps)
@@ -914,6 +918,10 @@ do_send(void)
         {
             perror("poll");
             fatal("poll for tx timestamp failed\n");
+        }
+        else if (r == 0)
+        {
+            fatal("timed out waiting for tx timestamp\n");
         }
         clock_gettime(CLOCK_REALTIME, &after_poll);
 
@@ -1214,15 +1222,15 @@ main(
     printf("  Compensated                      %8ldns\n\n", tx_rx_compensated);
 
     printf("Connection types:       Expected        Error\n");
-    printf("  Regular switch      %8luns   %8ldns\n", sfsw_expected, tx_rx_compensated - sfsw_expected);
-    if (tx_speed >= rx_speed)
-    {
-        printf("  Cut-through switch  %8luns   %8ldns\n", ctsw_expected, tx_rx_compensated - ctsw_expected);
-    }
     if (tx_speed == rx_speed)
     {
         printf("  loopback cable      %8luns   %8ldns\n", cable_comp, tx_rx_compensated - cable_comp);
     }
+    if (tx_speed >= rx_speed)
+    {
+        printf("  Cut-through switch  %8luns   %8ldns\n", ctsw_expected, tx_rx_compensated - ctsw_expected);
+    }
+    printf("  Regular switch      %8luns   %8ldns\n", sfsw_expected, tx_rx_compensated - sfsw_expected);
 
     return(0);
 }
