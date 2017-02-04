@@ -466,7 +466,6 @@ timespec_delta(
     const struct timespec *     ts1,
     const struct timespec *     ts2)
 {
-    // overkill...
     long long                   t1_nsec;
     long long                   t2_nsec;
 
@@ -669,8 +668,8 @@ ptp_offset_average(
     unsigned int *              samples_used)
 {
     long                        window[PTP_MAX_SAMPLES] = {0};
-    long                        total_offset = 0;
-    long                        total_window = 0;
+    long long                   total_offset = 0;
+    long long                   total_window = 0;
     long                        median_window;
     unsigned int                used = 0;
     struct ptp_clock_time *     pc;
@@ -693,13 +692,14 @@ ptp_offset_average(
         }
 
         pc = ptp_offset->ts + i * 2;
+        // FIXME warn on overflow
         total_offset += ptpclock_delta(&pc[1], &pc[0]);
 
         total_window += window[i];
         used++;
     }
 
-    *average = total_offset / (long) used + total_window / (long) used / 2;
+    *average = (long) (total_offset / used + total_window / used / 2L);
     *samples_used = used;
 }
 
@@ -1055,15 +1055,15 @@ main(
     long                        ctsw_expected;
     long                        cable_comp;
 
-    long                        tx_before_send_to_after_send_total = 0;
-    long                        tx_before_send_to_timestamp_total = 0;
-    long                        tx_after_send_to_before_poll_total = 0;
-    long                        tx_after_send_to_after_poll_total = 0;
-    long                        rx_timestamp_to_poll_return_total = 0;
-    long                        tx_rx_timestamp_total = 0;
+    long long                   tx_before_send_to_after_send_total = 0;
+    long long                   tx_before_send_to_timestamp_total = 0;
+    long long                   tx_after_send_to_before_poll_total = 0;
+    long long                   tx_after_send_to_after_poll_total = 0;
+    long long                   rx_timestamp_to_poll_return_total = 0;
+    long long                   tx_rx_timestamp_total = 0;
     unsigned long long          tx_rx_timestamp_total2 = 0;
-    long                        tx_ptp_offset_avg_total = 0;
-    long                        rx_ptp_offset_avg_total = 0;
+    long long                   tx_ptp_offset_avg_total = 0;
+    long long                   rx_ptp_offset_avg_total = 0;
     unsigned long               tx_ptp_samples_used_total = 0;
     unsigned long               rx_ptp_samples_used_total = 0;
     long *                      tx_rx_deltas;
@@ -1092,7 +1092,7 @@ main(
 
     tx_values = calloc((size_t) iterations, sizeof(*tx_values));
     rx_values = calloc((size_t) iterations, sizeof(*rx_values));
-    tx_rx_deltas = calloc((size_t) iterations, sizeof(long));
+    tx_rx_deltas = calloc((size_t) iterations, sizeof(*tx_rx_deltas));
     assert(tx_values);
     assert(rx_values);
 
