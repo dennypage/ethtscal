@@ -1136,17 +1136,18 @@ main(
     }
 
     cable_comp = (long) (cable_len * NSEC_PER_METER);
-    sfsw_expected = ETHER_SFSW_TX_BITS * BILLION / ((long) tx_speed * MILLION) +
-                    ETHER_SFSW_RX_BITS * BILLION / ((long) rx_speed * MILLION) +
+    sfsw_expected = ETHER_SFSW_TX_BITS * 1000L / (long) tx_speed +
+                    ETHER_SFSW_RX_BITS * 1000L / (long) rx_speed +
                     sw_comp + cable_comp;
-    ctsw_expected = ETHER_CTSW_TX_BITS * BILLION / ((long) tx_speed * MILLION) +
-                    ETHER_CTSW_RX_BITS * BILLION / ((long) rx_speed * MILLION) +
+    ctsw_expected = ETHER_CTSW_TX_BITS * 1000L / (long) tx_speed +
+                    ETHER_CTSW_RX_BITS * 1000L / (long) rx_speed +
                     sw_comp + cable_comp;
 
     if (iterations > 1)
     {
         printf("Iterating over %u packets (minimum runtime %ld seconds)\n\n", iterations,
-               (TX_SEND_DELAY * MILLION + sfsw_expected) * (long) iterations / BILLION);
+               (START_DELAY + TX_SEND_DELAY * (long) iterations) / 1000L +
+               (long) iterations / 1000L * sfsw_expected / MILLION);
     }
 
     // Ensure receive thread is ready
