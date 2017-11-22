@@ -1148,6 +1148,7 @@ main(
         printf("Iterating over %u packets (minimum runtime %ld seconds)\n\n", iterations,
                (START_DELAY + TX_SEND_DELAY * (long) iterations) / 1000L +
                (long) iterations / 1000L * sfsw_expected / MILLION);
+        fflush(stdout);
     }
 
     // Ensure receive thread is ready
