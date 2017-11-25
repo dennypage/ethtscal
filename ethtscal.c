@@ -896,6 +896,12 @@ do_send(void)
         msg_hdr.msg_controllen = sizeof (cmsg_buf);
 
         delay(TX_SEND_DELAY);
+        if (hwstamps)
+        {
+            // Record phy vs sys
+            ptp_offset_capture(tx_ptpdev, &ptp_offset);
+        }
+
         clock_gettime(CLOCK_REALTIME, &before_send);
         // Valgrind reports that sendto reads beyond the end of the sockaddr_ll. There doesn't seem
         // to be a reasonable way to prevent this.
@@ -906,12 +912,6 @@ do_send(void)
             fatal("send of packet from interface %s failed\n", tx_name);
         }
         clock_gettime(CLOCK_REALTIME, &after_send);
-
-        if (hwstamps)
-        {
-            // Record phy vs sys
-            ptp_offset_capture(tx_ptpdev, &ptp_offset);
-        }
 
         // Wait for the timestamp
         clock_gettime(CLOCK_REALTIME, &before_poll);
