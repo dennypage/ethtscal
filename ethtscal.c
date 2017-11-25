@@ -95,6 +95,8 @@
 
 // Command line parameters
 static const char *             progname;
+static char *                   data_file_name = NULL;
+static FILE *                   data_file = NULL;
 static unsigned int             hwstamps = 1;
 static unsigned int             iterations = 1;
 static unsigned int             ptp_samples = PTP_MAX_SAMPLES;
@@ -969,7 +971,7 @@ static void
 usage(void)
 {
     fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s [-S] [-i iterations] [-r rx_comp] [-t tx_comp] [-s sw_comp] [-c cable_len] [-p ptp_samples] src_iface dst_iface\n\n", progname);
+    fprintf(stderr, "  %s [-S] [-i iterations] [-r rx_comp] [-t tx_comp] [-s sw_comp] [-c cable_len] [-p ptp_samples] [-d file] src_iface dst_iface\n\n", progname);
     fprintf(stderr, "  options:\n");
     fprintf(stderr, "    -S use software timestamps instead of hardware timestamps (low accuracy)\n");
     fprintf(stderr, "    -i number of iterations (default 1)\n");
@@ -978,6 +980,7 @@ usage(void)
     fprintf(stderr, "    -s switch compensation in nanoseconds\n");
     fprintf(stderr, "    -c cable length in meters (default 0.0)\n");
     fprintf(stderr, "    -p number of ptp clock samples to request\n");
+    fprintf(stderr, "    -d dump raw data to file\n");
 }
 
 
@@ -994,7 +997,7 @@ parse_args(
 
     progname = argv[0];
 
-    while((opt = getopt(argc, argv, "Si:r:t:s:c:p:")) != -1)
+    while((opt = getopt(argc, argv, "Si:r:t:s:c:p:d:")) != -1)
     {
         switch (opt)
         {
@@ -1023,6 +1026,10 @@ parse_args(
                 fatal("ptp_samples must be less than or equal to %d\n", PTP_MAX_SAMPLES);
             }
             break;
+	case 'd':
+	    data_file_name = optarg;
+	    break;
+
         default:
             usage();
             exit(EXIT_FAILURE);
@@ -1089,6 +1096,16 @@ main(
 
     // Handle command line args
     parse_args(argc, argv);
+
+    if (data_file_name)
+    {
+        data_file = fopen(data_file_name, "w");
+        if (data_file == NULL)
+        {
+            perror("fopen");
+            fatal("cannot open data file\n");
+        }
+    }
 
     tx_values = calloc((size_t) iterations, sizeof(*tx_values));
     rx_values = calloc((size_t) iterations, sizeof(*rx_values));
@@ -1176,6 +1193,11 @@ main(
         tx_rx_deltas[i] = delta;
         tx_rx_timestamp_total += delta;
         tx_rx_timestamp_total2 += (unsigned long long) (delta * delta);
+
+        if (data_file)
+        {
+            fprintf(data_file, "%ld\n", delta);
+        }
     }
 
     tx_ptp_samples_used = tx_ptp_samples_used_total / iterations;
