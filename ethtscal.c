@@ -85,8 +85,10 @@
 #define MILLION                 (1000000L)
 #define BILLION                 (1000000000L)
 
-#define START_DELAY             (100)           // Milliseconds to delay before starting
-#define TX_SEND_DELAY           (2)             // Milliseconds to delay before each send
+#define START_DELAY             (1000L)         // Microseconds to delay before starting
+#define TX_SEND_DELAY           (100L)          // Microseconds to delay before each send
+#define WARNING_DELAY           (500L * 1000L)  // Microseconds to delay for warning
+
 #define TX_POLL_LIMIT           (1000L)         // Milliseconds to wait for timestamp
 #define RX_POLL_LIMIT           (2000L)         // Milliseconds to wait for packet
 
@@ -98,7 +100,7 @@ static const char *             progname;
 static char *                   data_file_name = NULL;
 static FILE *                   data_file = NULL;
 static unsigned int             hwstamps = 1;
-static unsigned int             iterations = 1;
+static unsigned int             iterations = 1000;
 static unsigned int             ptp_samples = PTP_MAX_SAMPLES;
 static long                     rx_comp = 0;
 static long                     tx_comp = 0;
@@ -176,17 +178,17 @@ fatal(
 
 
 //
-// Delay for N milliseconds
+// Delay for N microseconds
 //
 static void
 delay(
-    unsigned long               msec)
+    unsigned long               usec)
 {
     struct timespec             ts;
     int                         r;
 
-    ts.tv_sec = msec / 1000L;
-    ts.tv_nsec = msec % 1000L * MILLION;
+    ts.tv_sec = usec / MILLION;
+    ts.tv_nsec = usec % MILLION * 1000L;
     r = nanosleep(&ts, NULL);
     if (r == -1)
     {
@@ -300,7 +302,7 @@ socket_create(
     {
         printf("WARNING: Energy Efficient Ethernet is active on interface %s. Results will be incorrect.\n\n", ifname);
         fflush(stdout);
-        delay(500);
+        delay(WARNING_DELAY);
     }
 
     // Check for interrupt coalescing
@@ -318,7 +320,7 @@ socket_create(
     {
         printf("WARNING: Interrupt coalescing is active on interface %s. Results will be inaccurate.\n\n", ifname);
         fflush(stdout);
-        delay(500);
+        delay(WARNING_DELAY);
     }
 
     // Set up timestamping
@@ -994,6 +996,7 @@ parse_args(
     char * const                argv[])
 {
     int                         opt;
+    long                        l;
 
     progname = argv[0];
 
@@ -1005,7 +1008,12 @@ parse_args(
             hwstamps = 0;
             break;
         case 'i':
-            iterations = (unsigned int) strtoul(optarg, NULL, 10);
+            l = strtol(optarg, NULL, 10);
+            if (l < 1)
+            {
+                fatal("iterations must be at least 1\n");
+            }
+            iterations = (unsigned int) l;
             break;
         case 'r':
             rx_comp = strtol(optarg, NULL, 10);
@@ -1026,9 +1034,9 @@ parse_args(
                 fatal("ptp_samples must be less than or equal to %d\n", PTP_MAX_SAMPLES);
             }
             break;
-	case 'd':
-	    data_file_name = optarg;
-	    break;
+        case 'd':
+            data_file_name = optarg;
+            break;
 
         default:
             usage();
@@ -1121,7 +1129,7 @@ main(
     {
         printf("WARNING: Transmit and receive interfaces are the same. Results are unpredictable\n");
         fflush(stdout);
-        delay(500);
+        delay(WARNING_DELAY);
     }
 
     if (hwstamps)
@@ -1160,11 +1168,10 @@ main(
                     ETHER_CTSW_RX_BITS * 1000L / (long) rx_speed +
                     sw_comp + cable_comp;
 
-    if (iterations > 1)
+    if (iterations > 1000)
     {
         printf("Iterating over %u packets (minimum runtime %ld seconds)\n\n", iterations,
-               (START_DELAY + TX_SEND_DELAY * (long) iterations) / 1000L +
-               (long) iterations / 1000L * sfsw_expected / MILLION);
+               (START_DELAY + (TX_SEND_DELAY) * (long) iterations) / MILLION);
         fflush(stdout);
     }
 
@@ -1256,5 +1263,5 @@ main(
     }
     printf("  Regular switch      %8luns   %8ldns\n", sfsw_expected, tx_rx_compensated - sfsw_expected);
 
-    return(0);
+    exit(0);
 }
