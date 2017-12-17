@@ -138,8 +138,6 @@ typedef struct
     long                        before_send_to_timestamp;
     long                        after_send_to_before_poll;
     long                        after_send_to_after_poll;
-    long                        ptp_offset_avg;
-    unsigned int                ptp_samples_used;
 }
 tx_info;
 
@@ -147,8 +145,6 @@ typedef struct
 {
     struct timespec             timestamp;
     long                        timestamp_to_poll_return;
-    long                        ptp_offset_avg;
-    unsigned int                ptp_samples_used;
 }
 rx_info;
 
@@ -499,27 +495,6 @@ timespec_delta(
 
 
 //
-// Delta between two ptp clocks in nanoseconds
-//
-static long
-ptpclock_delta(
-    const struct ptp_clock_time * pc1,
-    const struct ptp_clock_time * pc2)
-{
-    struct timespec             ts1;
-    struct timespec             ts2;
-
-    ts1.tv_sec = pc1->sec;
-    ts1.tv_nsec = pc1->nsec;
-    ts2.tv_sec = pc2->sec;
-    ts2.tv_nsec = pc2->nsec;
-
-    return(timespec_delta(&ts1, &ts2));
-}
-
-
-
-//
 // sqrt function for standard deviation
 //
 static unsigned long
@@ -662,14 +637,79 @@ ptp_offset_capture(
 
 
 
+#if 1
+
 //
-// Compute the average ptp/sys clock offset
+// Choose the best ptp/sys clock offset by the narrowest window
 //
-static void
-ptp_offset_average(
-    struct ptp_sys_offset *     ptp_offset,
-    long *                      average,
-    unsigned int *              samples_used)
+static long
+best_ptp_offset(
+    struct ptp_sys_offset *     ptp_offset)
+{
+    struct ptp_clock_time *     pct;
+    long long                   sclock1, sclock2, pclock;
+    long                        window, best_window;
+    long long                   best_sclock, best_pclock;
+    unsigned int                i;
+
+    pct = ptp_offset->ts;
+
+    sclock1 = pct[0].sec * BILLION + pct[0].nsec;
+    pclock = pct[1].sec * BILLION + pct[1].nsec;
+    sclock2 = pct[2].sec * BILLION + pct[2].nsec;
+
+    best_window = sclock2 - sclock1;
+    best_sclock = sclock1;
+    best_pclock = pclock;
+
+    for (i = 1; i < ptp_offset->n_samples; i++)
+    {
+        pct = ptp_offset->ts + i * 2;
+
+        sclock1 = pct[0].sec * BILLION + pct[0].nsec;
+        pclock = pct[1].sec * BILLION + pct[1].nsec;
+        sclock2 = pct[2].sec * BILLION + pct[2].nsec;
+
+        window = sclock2 - sclock1;
+        if (window < best_window)
+        {
+            best_window = window;
+            best_sclock = sclock1;
+            best_pclock = pclock;
+        }
+    }
+
+    return(best_sclock + best_window / 2L - best_pclock);
+}
+
+#else
+
+//
+// Delta between two ptp clocks in nanoseconds
+//
+static long
+ptpclock_delta(
+    const struct ptp_clock_time * pc1,
+    const struct ptp_clock_time * pc2)
+{
+    struct timespec             ts1;
+    struct timespec             ts2;
+
+    ts1.tv_sec = pc1->sec;
+    ts1.tv_nsec = pc1->nsec;
+    ts2.tv_sec = pc2->sec;
+    ts2.tv_nsec = pc2->nsec;
+
+    return(timespec_delta(&ts1, &ts2));
+}
+
+
+//
+// Choose the best ptp/sys clock offset by averaging
+//
+static long
+best_ptp_offset(
+    struct ptp_sys_offset *     ptp_offset)
 {
     long                        window[PTP_MAX_SAMPLES] = {0};
     long long                   total_offset = 0;
@@ -703,9 +743,9 @@ ptp_offset_average(
         used++;
     }
 
-    *average = (long) (total_offset / used + total_window / used / 2L);
-    *samples_used = used;
+    return((long) (total_offset / used + total_window / used / 2L));
 }
+#endif
 
 
 
@@ -821,8 +861,7 @@ rx_thread(
 
                 if (hwstamps)
                 {
-                    ptp_offset_average(&ptp_offset, &rx_values[i].ptp_offset_avg, &rx_values[i].ptp_samples_used);
-                    timespec_addns(&rx_values[i].timestamp, rx_values[i].ptp_offset_avg);
+                    timespec_addns(&rx_values[i].timestamp, best_ptp_offset(&ptp_offset));
                 }
 
                 break;
@@ -953,14 +992,13 @@ do_send(void)
         }
         if (hwstamps)
         {
-            ptp_offset_average(&ptp_offset, &tx_values[i].ptp_offset_avg, &tx_values[i].ptp_samples_used);
-            timespec_addns(&tx_values[i].timestamp, tx_values[i].ptp_offset_avg);
+            timespec_addns(&tx_values[i].timestamp, best_ptp_offset(&ptp_offset));
         }
 
-         tx_values[i].before_send_to_after_send = timespec_delta(&before_send, &after_send);
-         tx_values[i].after_send_to_before_poll = timespec_delta(&after_send, &before_poll);
-         tx_values[i].after_send_to_after_poll = timespec_delta(&after_send, &after_poll);
-         tx_values[i].before_send_to_timestamp = timespec_delta(&before_send, &tx_values[i].timestamp);
+        tx_values[i].before_send_to_after_send = timespec_delta(&before_send, &after_send);
+        tx_values[i].after_send_to_before_poll = timespec_delta(&after_send, &before_poll);
+        tx_values[i].after_send_to_after_poll = timespec_delta(&after_send, &after_poll);
+        tx_values[i].before_send_to_timestamp = timespec_delta(&before_send, &tx_values[i].timestamp);
     }
 }
 
@@ -1070,6 +1108,12 @@ main(
     long                        ctsw_expected;
     long                        cable_comp;
 
+    struct ptp_sys_offset       ptp_offset;
+    long                        tx_initial_offset = 0;
+    long                        rx_initial_offset = 0;
+    long                        tx_final_offset = 0;
+    long                        rx_final_offset = 0;
+
     long long                   tx_before_send_to_after_send_total = 0;
     long long                   tx_before_send_to_timestamp_total = 0;
     long long                   tx_after_send_to_before_poll_total = 0;
@@ -1077,10 +1121,6 @@ main(
     long long                   rx_timestamp_to_poll_return_total = 0;
     long long                   tx_rx_timestamp_total = 0;
     unsigned long long          tx_rx_timestamp_total2 = 0;
-    long long                   tx_ptp_offset_avg_total = 0;
-    long long                   rx_ptp_offset_avg_total = 0;
-    unsigned long               tx_ptp_samples_used_total = 0;
-    unsigned long               rx_ptp_samples_used_total = 0;
     long *                      tx_rx_deltas;
 
     long                        tx_before_send_to_after_send;
@@ -1088,10 +1128,6 @@ main(
     long                        tx_after_send_to_before_poll;
     long                        tx_after_send_to_after_poll;
     long                        rx_timestamp_to_poll_return;
-    long                        tx_ptp_offset_avg;
-    long                        rx_ptp_offset_avg;
-    unsigned long               tx_ptp_samples_used;
-    unsigned long               rx_ptp_samples_used;
 
     long                        delta;
     long                        tx_rx_raw;
@@ -1178,18 +1214,30 @@ main(
     // Ensure receive thread is ready
     delay(START_DELAY);
 
+    if (hwstamps)
+    {
+        ptp_offset_capture(tx_ptpdev, &ptp_offset);
+        tx_initial_offset = best_ptp_offset(&ptp_offset);
+        ptp_offset_capture(rx_ptpdev, &ptp_offset);
+        rx_initial_offset = best_ptp_offset(&ptp_offset);
+    }
+
     // Do send
     do_send();
 
     // Wait for receive thread to return
     pthread_join(thread_id, NULL);
 
+    if (hwstamps)
+    {
+        ptp_offset_capture(tx_ptpdev, &ptp_offset);
+        tx_final_offset = best_ptp_offset(&ptp_offset);
+        ptp_offset_capture(rx_ptpdev, &ptp_offset);
+        rx_final_offset = best_ptp_offset(&ptp_offset);
+    }
+
     for (i = 0; i < iterations; i++)
     {
-        tx_ptp_samples_used_total += tx_values[i].ptp_samples_used;
-        rx_ptp_samples_used_total += rx_values[i].ptp_samples_used;
-        tx_ptp_offset_avg_total += tx_values[i].ptp_offset_avg;
-        rx_ptp_offset_avg_total += rx_values[i].ptp_offset_avg;
         tx_before_send_to_after_send_total += tx_values[i].before_send_to_after_send;
         tx_before_send_to_timestamp_total += tx_values[i].before_send_to_timestamp;
         tx_after_send_to_before_poll_total += tx_values[i].after_send_to_before_poll;
@@ -1197,6 +1245,13 @@ main(
         rx_timestamp_to_poll_return_total += rx_values[i].timestamp_to_poll_return;
 
         delta = timespec_delta(&tx_values[i].timestamp, &rx_values[i].timestamp);
+#if 0
+        if (delta < 0)
+        {
+            printf("Time warp in delta\n");
+        }
+#endif
+
         tx_rx_deltas[i] = delta;
         tx_rx_timestamp_total += delta;
         tx_rx_timestamp_total2 += (unsigned long long) (delta * delta);
@@ -1206,11 +1261,6 @@ main(
             fprintf(data_file, "%ld\n", delta);
         }
     }
-
-    tx_ptp_samples_used = tx_ptp_samples_used_total / iterations;
-    rx_ptp_samples_used = rx_ptp_samples_used_total / iterations;
-    tx_ptp_offset_avg = tx_ptp_offset_avg_total / (long) iterations;
-    rx_ptp_offset_avg = rx_ptp_offset_avg_total / (long) iterations;
 
     tx_before_send_to_after_send = tx_before_send_to_after_send_total / (long) iterations;
     tx_before_send_to_timestamp = tx_before_send_to_timestamp_total / (long) iterations;
@@ -1225,13 +1275,12 @@ main(
 
     printf("Tx interface %s, speed %dMb, adddress %s\n", tx_name, tx_speed, ether_ntoa(&tx_addr));
     printf("Rx interface %s, speed %dMb, adddress %s\n", rx_name, rx_speed, ether_ntoa(&rx_addr));
-    printf("\n");
     if (hwstamps)
     {
-        printf("Tx avg ptp offset %ldns, %lu of %u samples used\n", tx_ptp_offset_avg, tx_ptp_samples_used, ptp_samples);
-        printf("Rx avg ptp offset %ldns, %lu of %u samples used\n", rx_ptp_offset_avg, rx_ptp_samples_used, ptp_samples);
-        printf("\n");
+        printf("Tx drift during run %ld\n", tx_initial_offset - tx_final_offset);
+        printf("Rx drift during run %ld\n", rx_initial_offset - rx_final_offset);
     }
+    printf("\n");
 
     printf("Misc times:\n");
     printf("  Tx before send  ->  after send   %8ldns\n", tx_before_send_to_after_send);
