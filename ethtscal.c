@@ -94,13 +94,15 @@
 
 #define CMSG_BUF_LEN            (256)
 
+#define DEFAULT_ITERATIONS      (10000)
 
 // Command line parameters
 static const char *             progname;
 static char *                   data_file_name = NULL;
 static FILE *                   data_file = NULL;
+static unsigned int             analyze_clocks = 0;
 static unsigned int             hwstamps = 1;
-static unsigned int             iterations = 1000;
+static unsigned int             iterations = DEFAULT_ITERATIONS;
 static unsigned int             ptp_samples = PTP_MAX_SAMPLES;
 static long                     rx_comp = 0;
 static long                     tx_comp = 0;
@@ -749,6 +751,138 @@ best_ptp_offset(
 
 
 
+
+#define ANALYZE_ITERATIONS 10000
+static void
+analyze_clock_step(
+    clockid_t                   clock)
+{
+    long                        step;
+    long                        min = LONG_MAX;
+    long                        max = 0;
+    long                        total = 0;
+    struct timespec             ts1;
+    struct timespec             ts2;
+    unsigned int                i;
+    int                         r1, r2;
+
+    for (i = 0; i < ANALYZE_ITERATIONS; i++)
+    {
+        r1 = clock_gettime(clock, &ts1);
+        r2 = clock_gettime(clock, &ts2);
+        if (r1 != 0 || r2 != 0)
+        {
+            perror("clock_gettime");
+            fatal("cannot get clock time for clock %d\n", clock);
+        }
+
+        step = timespec_delta(&ts1, &ts2);
+        if (step < min)
+        {
+            min = step;
+        }
+        if (step > max)
+        {
+            max = step;
+        }
+        total += step;
+    }
+
+    printf("  step via direct call:    min %ld  max %ld  avg %ld\n", min, max, total / ANALYZE_ITERATIONS);
+}
+
+
+
+static void
+analyze_ptp_clock(
+    int                         ptpdev)
+{
+    struct ptp_sys_offset       ptp_offset;
+    struct ptp_clock_time *     pct;
+    long long                   sclock1, sclock2, pclock;
+    long long                   last_pclock;
+    long                        step;
+    long                        sclock_min = LONG_MAX;
+    long                        sclock_max = 0;
+    long                        pclock_min = LONG_MAX;
+    long                        pclock_max = 0;
+    long long                   sclock_total = 0;
+    long long                   pclock_total = 0;
+    unsigned int                i;
+    unsigned int                s;
+    int                         r;
+
+    ptp_offset.n_samples = (unsigned int) PTP_MAX_SAMPLES;
+
+    for (i = 0; i < ANALYZE_ITERATIONS; i++)
+    {
+        r = ioctl(ptpdev, PTP_SYS_OFFSET, &ptp_offset);
+        if (r == -1)
+        {
+            perror("ioctl");
+            fatal("request for PTP_SYS_OFFSET failed\n");
+        }
+        pct = ptp_offset.ts;
+
+        sclock1 = pct[0].sec * BILLION + pct[0].nsec;
+        pclock = pct[1].sec * BILLION + pct[1].nsec;
+        sclock2 = pct[2].sec * BILLION + pct[2].nsec;
+
+        step = sclock2 - sclock1;
+        if (step < sclock_min)
+        {
+            sclock_min = step;
+        }
+        if (step > sclock_max)
+        {
+            sclock_max = step;
+        }
+        sclock_total+= step;
+
+        last_pclock = pclock;
+
+        for (s = 1; s < ptp_offset.n_samples; s++)
+        {
+            pct = ptp_offset.ts + s * 2;
+
+            sclock1 = pct[0].sec * BILLION + pct[0].nsec;
+            pclock = pct[1].sec * BILLION + pct[1].nsec;
+            sclock2 = pct[2].sec * BILLION + pct[2].nsec;
+
+            step = sclock2 - sclock1;
+            if (step < sclock_min)
+            {
+                sclock_min = step;
+            }
+            if (step > sclock_max)
+            {
+                sclock_max = step;
+            }
+            sclock_total+= step;
+
+            step = pclock - last_pclock;
+            if (step < pclock_min)
+            {
+                pclock_min = step;
+            }
+            if (step > pclock_max)
+            {
+                pclock_max = step;
+            }
+            pclock_total+= step;
+            last_pclock = pclock;
+        }
+    }
+
+    analyze_clock_step( ((~(clockid_t) (ptpdev) << 3) | 3));
+    printf("  sys step via ptp offset: min %ld  max %ld  avg %ld\n",
+        sclock_min, sclock_max, (long) (sclock_total / (ANALYZE_ITERATIONS * PTP_MAX_SAMPLES)));
+    printf("  ptp step via ptp offset: min %ld  max %ld  avg %ld\n",
+         pclock_min, pclock_max, (long) (pclock_total / (ANALYZE_ITERATIONS * (PTP_MAX_SAMPLES - 1))));
+}
+
+
+
 //
 // Process a control message for timestamp info
 //
@@ -1013,6 +1147,7 @@ usage(void)
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s [-S] [-i iterations] [-r rx_comp] [-t tx_comp] [-s sw_comp] [-c cable_len] [-p ptp_samples] [-d file] src_iface dst_iface\n\n", progname);
     fprintf(stderr, "  options:\n");
+    fprintf(stderr, "    -A analyze clocks\n");
     fprintf(stderr, "    -S use software timestamps instead of hardware timestamps (low accuracy)\n");
     fprintf(stderr, "    -i number of iterations (default 1)\n");
     fprintf(stderr, "    -r receive compensation in nanoseconds\n");
@@ -1038,10 +1173,13 @@ parse_args(
 
     progname = argv[0];
 
-    while((opt = getopt(argc, argv, "Si:r:t:s:c:p:d:")) != -1)
+    while((opt = getopt(argc, argv, "ASi:r:t:s:c:p:d:")) != -1)
     {
         switch (opt)
         {
+        case 'A':
+            analyze_clocks = 1;
+            break;
         case 'S':
             hwstamps = 0;
             break;
@@ -1168,11 +1306,26 @@ main(
         delay(WARNING_DELAY);
     }
 
+    if (analyze_clocks)
+    {
+        printf("analyzing system clock...\n");
+        analyze_clock_step(CLOCK_REALTIME);
+    }
+
     if (hwstamps)
     {
         // Open the ptp descriptors
         tx_ptpdev = ptpdev_open(tx_ptp_index);
         rx_ptpdev = ptpdev_open(rx_ptp_index);
+
+        if (analyze_clocks)
+        {
+            printf("analyzing tx clock...\n");
+            analyze_ptp_clock(tx_ptpdev);
+            printf("analyzing rx clock...\n");
+            analyze_ptp_clock(rx_ptpdev);
+            printf("\n\n");
+        }
     }
     else
     {
@@ -1204,12 +1357,9 @@ main(
                     ETHER_CTSW_RX_BITS * 1000L / (long) rx_speed +
                     sw_comp + cable_comp;
 
-    if (iterations > 1000)
-    {
-        printf("Iterating over %u packets (minimum runtime %ld seconds)\n\n", iterations,
-               (START_DELAY + (TX_SEND_DELAY) * (long) iterations) / MILLION);
-        fflush(stdout);
-    }
+    printf("Iterating over %u packets (minimum runtime %ld seconds)\n\n", iterations,
+           (START_DELAY + (TX_SEND_DELAY) * (long) iterations) / MILLION);
+    fflush(stdout);
 
     // Ensure receive thread is ready
     delay(START_DELAY);
