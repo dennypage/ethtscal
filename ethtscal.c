@@ -1,6 +1,6 @@
 
 /*
- * Copyright (c) 2016-2017 Denny Page
+ * Copyright (c) 2016-2019 Denny Page
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -812,6 +812,9 @@ analyze_ptp_clock(
     unsigned int                s;
     int                         r;
 
+    // Silence valgrind
+    memset(&ptp_offset, 0, sizeof(ptp_offset));
+
     ptp_offset.n_samples = (unsigned int) PTP_MAX_SAMPLES;
 
     for (i = 0; i < ANALYZE_ITERATIONS; i++)
@@ -1314,6 +1317,9 @@ main(
 
     if (hwstamps)
     {
+        // Silence valgrind
+        memset(&ptp_offset, 0, sizeof(ptp_offset));
+
         // Open the ptp descriptors
         tx_ptpdev = ptpdev_open(tx_ptp_index);
         rx_ptpdev = ptpdev_open(rx_ptp_index);
